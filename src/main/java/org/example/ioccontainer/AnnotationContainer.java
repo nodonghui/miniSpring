@@ -6,10 +6,7 @@ import java.lang.reflect.Constructor;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.lang.reflect.Parameter;
-import java.util.HashMap;
-import java.util.List;
-import java.util.Map;
-import java.util.Set;
+import java.util.*;
 
 public class AnnotationContainer {
 	private Map<Class<?>, Object> beanMap = new HashMap<>();
@@ -22,16 +19,38 @@ public class AnnotationContainer {
 
 	public AnnotationContainer(String basePackage) {
 		try {
-			Set<Class<?>> componentClasses = ComponentScanner.scan(basePackage);
-			// 1. @Component 클래스 인스턴스 생성
-			for (Class<?> clazz : componentClasses) {
-				if (clazz.isAnnotationPresent(Component.class)) {
-					Object instance = createInstance(clazz);
-					beanMap.put(clazz, instance);
+			Map<Class<?>, BeanNode> graph = new HashMap<>();
 
-					String name= resolveQualifierName(clazz);
-					nameToBeanMap.put(name,instance);
+			Set<Class<?>> componentClasses = ComponentScanner.scan(basePackage);
+
+			for (Class<?> clazz : componentClasses) {
+				if (!clazz.isAnnotationPresent(Component.class)) continue;
+
+				BeanNode node = new BeanNode(clazz);
+
+				for(Constructor<?> ctor : clazz.getDeclaredConstructors()) {
+					if(ctor.isAnnotationPresent(Inject.class)) {
+						for(Parameter param : ctor.getParameters()) {
+							node.dependencies.add(resolveActualType(param.getType()));
+						}
+					}
 				}
+
+				for(Field field : clazz.getDeclaredFields()) {
+					if(field.isAnnotationPresent(Inject.class)) {
+						node.dependencies.add(resolveActualType(field.getType()));
+					}
+				}
+
+				graph.put(clazz,node);
+			}
+
+			List<Class<?>> sorted = topologicalSort(graph);
+
+			for(Class<?> clazz : sorted) {
+				Object instance = createInstance(clazz);
+				beanMap.put(clazz, instance);
+				nameToBeanMap.put(resolveQualifierName(clazz),instance);
 			}
 
 			// 2. @Inject 필드에 의존성 주입
@@ -134,5 +153,45 @@ public class AnnotationContainer {
 	private String decapitalize(String name) {
 		if (name == null || name.isEmpty()) return name;
 		return Character.toLowerCase(name.charAt(0)) + name.substring(1);
+	}
+
+	private Class<?> resolveActualType(Class<?> type) {
+		return interfaceToImplMap.getOrDefault(type,type);
+	}
+
+	private List<Class<?>> topologicalSort(Map<Class<?>, BeanNode> graph) {
+		Map<Class<?>, Integer> inDegree = new HashMap<>();
+		for(BeanNode node : graph.values()) {
+			inDegree.putIfAbsent(node.clazz,0);
+			for(Class<?> dep : node.dependencies) {
+				inDegree.put(dep,inDegree.getOrDefault(dep,0) +1);
+			}
+		}
+
+		Queue<Class<?>> queue = new LinkedList<>();
+		for(Map.Entry<Class<?>, Integer> entry : inDegree.entrySet()) {
+			if(entry.getValue() == 0) queue.add(entry.getKey());
+		}
+
+		List<Class<?>> result = new ArrayList<>();
+		while(!queue.isEmpty()) {
+			Class<?> clazz = queue.poll();
+			result.add(clazz);
+
+			if (!graph.containsKey(clazz)) {
+				throw new RuntimeException("의존성 그래프에 없는 클래스: " + clazz);
+			}
+
+			for(Class<?> other : graph.getOrDefault(clazz, new BeanNode(clazz)).dependencies) {
+				inDegree.put(other, inDegree.get(other)-1);
+				if (inDegree.get(other) == 0) queue.add(other);
+			}
+		}
+
+		if (result.size() != graph.size()) {
+			throw new RuntimeException("순환 의존성 존재: " + graph.keySet());
+		}
+
+		return result;
 	}
 }
